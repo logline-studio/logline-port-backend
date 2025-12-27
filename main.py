@@ -5,8 +5,10 @@ from datetime import datetime, timedelta
 app = FastAPI()
 
 # --- CONFIGURATION ---
-LEMON_API_KEY = "YOUR_SECRET_API_KEY_HERE" # Get this from Lemon Squeezy Settings -> API
-MAINTENANCE_VARIANT_ID = 99999 # REPLACE with the Variant ID of your "1 Year Maintenance" product
+MAINTENANCE_VARIANT_ID = 746775 # REPLACE with the Variant ID of your "1 Year Maintenance" product
+LEMON_API_KEY = os.environ.get("LEMON_API_KEY")
+if not LEMON_API_KEY:
+    raise ValueError("LEMON_API_KEY is not set in environment variables!")
 
 def is_maintenance_product(order):
     """
@@ -77,4 +79,5 @@ def sync_maintenance(data: dict):
     return {
         "status": "active",
         "updates_until": updates_until.strftime("%Y-%m-%d")
+
     }
