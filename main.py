@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 app = FastAPI()
 
 # --- CONFIGURATION ---
-MAINTENANCE_VARIANT_ID = 746775 
+MAINTENANCE_VARIANT_ID = 1175280 
 LEMON_API_KEY = os.environ.get("LEMON_API_KEY")
 
 if not LEMON_API_KEY:
@@ -84,3 +84,4 @@ def sync_maintenance(data: dict):
         "status": "active",
         "updates_until": updates_until.strftime("%Y-%m-%d")
     }
+
