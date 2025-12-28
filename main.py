@@ -21,12 +21,10 @@ REST_HEADERS = {
 LICENSE_API_VALIDATE_URL = "https://api.lemonsqueezy.com/v1/licenses/validate"
 ORDERS_URL = "https://api.lemonsqueezy.com/v1/orders"
 
-# We removed 'email' from here. We will get it securely from Lemon Squeezy.
 class SyncReq(BaseModel):
     license_key: str
 
 def parse_iso(dt_str: str) -> datetime:
-    # Handle Z (UTC) safely
     return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
 
 def is_maintenance_product(order: dict) -> bool:
@@ -42,7 +40,6 @@ def list_orders_by_email(email: str) -> list[dict]:
     while True:
         r = requests.get(url, headers=REST_HEADERS, params=params, timeout=20)
         if r.status_code != 200:
-            # If we fail to list orders, we just return empty to avoid crashing
             print(f"Error fetching orders: {r.text}") 
             break
 
@@ -77,21 +74,16 @@ def sync_maintenance(req: SyncReq):
     if not vj.get("valid"):
         raise HTTPException(status_code=400, detail="Invalid license key")
 
-    # 2) Extract SECURE data from the validation response
-    # The 'meta' object contains the customer email and key creation date.
+    # 2) Extract SECURE data
     meta = vj.get("meta", {})
     license_key_info = vj.get("license_key", {})
     
-    # Get secure email (don't trust user input)
     secure_email = meta.get("customer_email")
     if not secure_email:
-         # Fallback: sometimes it's in different spots depending on API version
         secure_email = license_key_info.get("user_email")
 
-    # Get ORIGINAL purchase date (Critical Fix!)
     created_at_str = license_key_info.get("created_at")
     if not created_at_str:
-        # Fallback to now ONLY if date is missing (rare)
         created_at = datetime.now(timezone.utc)
     else:
         created_at = parse_iso(created_at_str)
@@ -99,18 +91,21 @@ def sync_maintenance(req: SyncReq):
     # 3) Establish Baseline: Original Date + 1 Year
     updates_until = created_at + timedelta(days=365)
     
-    # 4) Find maintenance purchases using the SECURE email
-    # Only if we found an email. If not, they just get the base 1 year.
+    # 4) Find PAID maintenance purchases
     if secure_email:
         orders = list_orders_by_email(secure_email)
         
         maint_orders = []
         for o in orders:
+            # Check 1: Is it the maintenance product?
             if is_maintenance_product(o):
                 attrs = o.get("attributes", {}) or {}
-                order_created = attrs.get("created_at")
-                if order_created:
-                    maint_orders.append(parse_iso(order_created))
+                
+                # Check 2: Is the order PAID? (Refunded/Failed orders are ignored) <--- NEW FIX
+                if attrs.get("status") == "paid": 
+                    order_created = attrs.get("created_at")
+                    if order_created:
+                        maint_orders.append(parse_iso(order_created))
 
         maint_orders.sort()
 
@@ -118,11 +113,8 @@ def sync_maintenance(req: SyncReq):
         now = datetime.now(timezone.utc)
         for _ in maint_orders:
             if updates_until < now:
-                # If expired, restart from today (purchase date of maintenance)
-                # Actually, standard logic is usually "From today" if expired
                 updates_until = now + timedelta(days=365)
             else:
-                # If active, extend
                 updates_until = updates_until + timedelta(days=365)
 
     return {
