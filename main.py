@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 import requests
 import os
 from datetime import datetime, timedelta, timezone
@@ -18,27 +18,23 @@ REST_HEADERS = {
     "Content-Type": "application/vnd.api+json",
 }
 
-LICENSE_API_VALIDATE_URL = "https://api.lemonsqueezy.com/v1/licenses/validate"  # :contentReference[oaicite:6]{index=6}
-ORDERS_URL = "https://api.lemonsqueezy.com/v1/orders"  # :contentReference[oaicite:7]{index=7}
+LICENSE_API_VALIDATE_URL = "https://api.lemonsqueezy.com/v1/licenses/validate"
+ORDERS_URL = "https://api.lemonsqueezy.com/v1/orders"
 
-
+# We removed 'email' from here. We will get it securely from Lemon Squeezy.
 class SyncReq(BaseModel):
     license_key: str
-    email: EmailStr
-
 
 def parse_iso(dt_str: str) -> datetime:
+    # Handle Z (UTC) safely
     return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-
 
 def is_maintenance_product(order: dict) -> bool:
     attrs = order.get("attributes", {}) or {}
     first_item = attrs.get("first_order_item", {}) or {}
     return first_item.get("variant_id") == MAINTENANCE_VARIANT_ID
 
-
 def list_orders_by_email(email: str) -> list[dict]:
-    # Lemon uses page-based pagination with links.next :contentReference[oaicite:8]{index=8}
     url = ORDERS_URL
     params = {"filter[user_email]": email, "page[size]": 100}
     orders = []
@@ -46,7 +42,9 @@ def list_orders_by_email(email: str) -> list[dict]:
     while True:
         r = requests.get(url, headers=REST_HEADERS, params=params, timeout=20)
         if r.status_code != 200:
-            raise HTTPException(status_code=400, detail="Could not fetch orders from Lemon")
+            # If we fail to list orders, we just return empty to avoid crashing
+            print(f"Error fetching orders: {r.text}") 
+            break
 
         payload = r.json()
         orders.extend(payload.get("data", []) or [])
@@ -54,20 +52,17 @@ def list_orders_by_email(email: str) -> list[dict]:
         next_url = (payload.get("links", {}) or {}).get("next")
         if not next_url:
             break
-
         url = next_url
-        params = None  # next_url already contains params
+        params = None 
 
     return orders
-
 
 @app.post("/sync-maintenance")
 def sync_maintenance(req: SyncReq):
     if not LEMON_API_KEY:
         raise HTTPException(status_code=500, detail="Server misconfiguration: No API Key")
 
-    # 1) Validate the perpetual license key (License API)
-    # This endpoint validates the key string. :contentReference[oaicite:9]{index=9}
+    # 1) Validate the license key
     v = requests.post(
         LICENSE_API_VALIDATE_URL,
         data={"license_key": req.license_key},
@@ -82,31 +77,55 @@ def sync_maintenance(req: SyncReq):
     if not vj.get("valid"):
         raise HTTPException(status_code=400, detail="Invalid license key")
 
-    # 2) Base entitlement: you already set "activation date + 365" in the app.
-    # Backend should mirror that: start from *now* and extend. (No created_at available reliably.)
-    now = datetime.now(timezone.utc)
-    updates_until = now + timedelta(days=365)
+    # 2) Extract SECURE data from the validation response
+    # The 'meta' object contains the customer email and key creation date.
+    meta = vj.get("meta", {})
+    license_key_info = vj.get("license_key", {})
+    
+    # Get secure email (don't trust user input)
+    secure_email = meta.get("customer_email")
+    if not secure_email:
+         # Fallback: sometimes it's in different spots depending on API version
+        secure_email = license_key_info.get("user_email")
 
-    # 3) Find maintenance purchases by email
-    orders = list_orders_by_email(req.email)
+    # Get ORIGINAL purchase date (Critical Fix!)
+    created_at_str = license_key_info.get("created_at")
+    if not created_at_str:
+        # Fallback to now ONLY if date is missing (rare)
+        created_at = datetime.now(timezone.utc)
+    else:
+        created_at = parse_iso(created_at_str)
 
-    # Optional: count only paid orders (adapt field names if needed)
-    # We'll still require maintenance variant match; you can add status checks later.
-    maint_orders = []
-    for o in orders:
-        if is_maintenance_product(o):
-            attrs = o.get("attributes", {}) or {}
-            created_at = attrs.get("created_at")
-            if created_at:
-                maint_orders.append(parse_iso(created_at))
+    # 3) Establish Baseline: Original Date + 1 Year
+    updates_until = created_at + timedelta(days=365)
+    
+    # 4) Find maintenance purchases using the SECURE email
+    # Only if we found an email. If not, they just get the base 1 year.
+    if secure_email:
+        orders = list_orders_by_email(secure_email)
+        
+        maint_orders = []
+        for o in orders:
+            if is_maintenance_product(o):
+                attrs = o.get("attributes", {}) or {}
+                order_created = attrs.get("created_at")
+                if order_created:
+                    maint_orders.append(parse_iso(order_created))
 
-    maint_orders.sort()
+        maint_orders.sort()
 
-    # 4) Stack: +1 year per maintenance order
-    for _dt in maint_orders:
-        if updates_until < now:
-            updates_until = now + timedelta(days=365)
-        else:
-            updates_until = updates_until + timedelta(days=365)
+        # 5) Stack Years
+        now = datetime.now(timezone.utc)
+        for _ in maint_orders:
+            if updates_until < now:
+                # If expired, restart from today (purchase date of maintenance)
+                # Actually, standard logic is usually "From today" if expired
+                updates_until = now + timedelta(days=365)
+            else:
+                # If active, extend
+                updates_until = updates_until + timedelta(days=365)
 
-    return {"status": "active", "updates_until": updates_until.strftime("%Y-%m-%d")}
+    return {
+        "status": "active", 
+        "updates_until": updates_until.strftime("%Y-%m-%d")
+    }
